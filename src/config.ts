@@ -20,8 +20,8 @@ export interface Config {
 
 export const Config: Schema<Config> = Schema.object({
   enabled: Schema.boolean().default(true).description('Whether the advisor reviews turns.'),
-  provider: Schema.string().default('deepseek').description('LLM provider route for the advisor model.'),
-  model: Schema.string().default('deepseek-chat').description('Advisor model id from the DSH model list.'),
+  provider: Schema.string().default('deepseek-official').description('LLM provider route for the advisor model.'),
+  model: Schema.string().default('deepseek-v4-flash').description('Advisor model id from the DSH model list.'),
   reasoningEffort: Schema.string().default('').description('Optional reasoning effort passed to the advisor model.'),
   persona: Schema.string()
     .role('textarea')

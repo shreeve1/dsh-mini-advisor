@@ -46,7 +46,7 @@ const ADVISE_TOOL = {
 const CREATE_GOAL_TOOL = {
   name: 'create_goal',
   description:
-    'Set the session-level goal when the user\'s ask has a clear overarching objective the agent should be held to. Use sparingly — one goal per session. Replaces any existing goal.',
+    "Set the session goal when the user's ask has a clear overarching objective the agent should be held to. Use sparingly — one goal per session. (Fails silently if a goal already exists in this session; only the first goal will stick.)",
   parameters: {
     type: 'object',
     properties: {
@@ -231,10 +231,27 @@ export function apply(ctx: HostContext): void {
       }
 
       const blocks: Array<Record<string, unknown>> = []
+      let streamError: { code: string; message: string } | undefined
       for await (const chunk of ctx.llm.stream(request)) {
         if (chunk.type === 'block-end' && chunk.block) blocks.push(chunk.block as Record<string, unknown>)
+        else if (chunk.type === 'finish') {
+          // The LLM service converts adapter throws (NO_ADAPTER, etc.) into a
+          // terminal `finish` chunk with kind: 'error' via adapterFailureChunk;
+          // surface that into the sidebar activity so a dead advisor is visible.
+          const reason = chunk.reason as { kind?: string; failure?: { code?: string; message?: string } } | undefined
+          if (reason?.kind === 'error' && reason.failure) {
+            const code = String(reason.failure.code ?? 'UNKNOWN')
+            const message = String(reason.failure.message ?? 'unknown error')
+            streamError = { code, message }
+          }
+        }
       }
 
+      if (streamError) {
+        activity.setLastError(sessionId, `${streamError.code}: ${streamError.message}`)
+        ctx.logger?.debug?.(`${PLUGIN_NAME}: llm stream error`, { session: sessionId, ...streamError })
+        return
+      }
       activity.setLastError(sessionId, undefined)
 
       // Native goal creation (direct): set the session goal through ctx.goals.

@@ -20,6 +20,8 @@ interface ConfigView {
   reasoningEffort: string
   persona: string
   minDeltaChars: number
+  createGoals: boolean
+  createTasks: boolean
 }
 
 interface ClientCtx {
@@ -141,6 +143,26 @@ export function createSettingsSection(ctx: ClientCtx): React.ComponentType<{ clo
           />
           <span style={styles.hint}>Skip a review when the transcript delta is shorter than this.</span>
         </div>
+
+        <label style={styles.toggle}>
+          <input
+            type="checkbox"
+            checked={config.createGoals}
+            onChange={(e) => patch({ createGoals: e.target.checked })}
+          />
+          <span style={styles.label}>Create goals</span>
+          <span style={styles.hint}>Let the advisor set the session goal directly.</span>
+        </label>
+
+        <label style={styles.toggle}>
+          <input
+            type="checkbox"
+            checked={config.createTasks}
+            onChange={(e) => patch({ createTasks: e.target.checked })}
+          />
+          <span style={styles.label}>Create tasks</span>
+          <span style={styles.hint}>Let the advisor add tasks to the todo checklist.</span>
+        </label>
 
         <div style={styles.footer}>
           <button style={styles.button} onClick={() => void save()} disabled={saving}>

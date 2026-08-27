@@ -1,6 +1,6 @@
 {
   "name": "dsh-mini-advisor",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "A minimal advisor watchdog for DeepSeek Harness: a second model reviews each turn and injects weighable advice.",
   "type": "module",
   "main": "lib/index.js",
