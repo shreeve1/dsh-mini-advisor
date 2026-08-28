@@ -4,13 +4,13 @@ import { Config, normalizeConfig } from './config'
 import type { Config as ConfigShape } from './config'
 import { PLUGIN_NAME, renderDelta } from './delta'
 import type { SessionEvent } from './delta'
-import { addTasks, createGoal } from './goal-tasks'
+import { addTasks, completeGoal, setGoal } from './goal-tasks'
 import type { GoalService } from './goal-tasks'
 import { RPC_CHANNEL, registerConfigRpc } from './rpc'
 
 export const name = PLUGIN_NAME
 // `settings` backs the live config scope; `goals` is the native same-session
-// goal service the advisor creates goals through. `connection` is deliberately
+// goal service the keeper creates goals through. `connection` is deliberately
 // NOT listed: it is an OPTIONAL service (absent in headless profiles), and a
 // missing inject name would strand this whole fiber. registerConfigRpc probes
 // `ctx.connection` at runtime and no-ops when it is absent.
@@ -20,13 +20,19 @@ export const inject = ['agents', 'llm', 'settings', 'goals']
 export { Config }
 export { RPC_CHANNEL }
 
-/** Settings namespace: the key the config scope and Settings tab share. */
-export const SETTINGS_NAMESPACE = PLUGIN_NAME
+/**
+ * Settings namespace: pinned to the original 'dsh-mini-advisor' literal even
+ * though the plugin was renamed to dsh-goal-keeper, so existing saved settings
+ * (provider/model overrides) are not orphaned by the rename.
+ */
+export const SETTINGS_NAMESPACE = 'dsh-mini-advisor'
 
 const SYSTEM_PROMPT_TAIL = [
-  'You review the latest slice of a coding-agent transcript below.',
-  'When something matters, call the `advise` tool exactly once with a short, concrete note and a severity (nit | concern | blocker).',
-  'If nothing needs saying, do not call any tool — just reply "ok".',
+  'You are a goal-keeper watching the latest slice of a coding-agent transcript below.',
+  'Your job is to keep the primary agent on track toward its objective until it is genuinely done.',
+  'Use every tool that applies this turn, not just one — the tools are independent, and more than one can fire in the same review.',
+  'When something matters — a bug, a security hole, a wrong turn, or a premature "done" — call the `advise` tool with a short, concrete note and a severity (nit | concern | blocker).',
+  'If nothing needs any tool, reply "ok".',
 ].join('\n')
 
 const ADVISE_TOOL = {
@@ -43,10 +49,10 @@ const ADVISE_TOOL = {
   },
 } as const
 
-const CREATE_GOAL_TOOL = {
-  name: 'create_goal',
+const SET_GOAL_TOOL = {
+  name: 'set_goal',
   description:
-    "Set the session goal when the user's ask has a clear overarching objective the agent should be held to. Use sparingly — one goal per session. (Fails silently if a goal already exists in this session; only the first goal will stick.)",
+    "Set or update the session's overarching objective when the user's ask has a clear goal the agent should be held to. Creates the goal if none exists, or revises the objective if one already does. One goal per session; keep it current as the work's true objective becomes clearer.",
   parameters: {
     type: 'object',
     properties: {
@@ -57,10 +63,21 @@ const CREATE_GOAL_TOOL = {
   },
 } as const
 
-const ADD_TASKS_TOOL = {
-  name: 'add_tasks',
+const COMPLETE_GOAL_TOOL = {
+  name: 'complete_goal',
   description:
-    "Add concrete tasks to the agent's todo checklist when the work has clear steps the agent has not tracked. Tasks are appended to the existing list, never replacing the agent's own todos.",
+    'Mark the session goal complete when the objective is genuinely achieved — the work is done, verified, and nothing material remains. Only call this when you are confident the goal is finished; it closes the goal and stops keeper continuation.',
+  parameters: {
+    type: 'object',
+    properties: {},
+    additionalProperties: false,
+  },
+} as const
+
+const UPDATE_TASKS_TOOL = {
+  name: 'update_tasks',
+  description:
+    "Add concrete next steps to the agent's todo checklist when the work has clear steps it has not tracked. Tasks are appended to the existing list, never replacing the agent's own todos, so do not repeat steps it already tracks.",
   parameters: {
     type: 'object',
     properties: {
@@ -89,15 +106,52 @@ interface SettingsScope {
   update(patch: unknown): unknown
 }
 
+interface ResolvedModelInfo {
+  reasoning?: {
+    efforts: Array<{ id: string; name: string; description?: string }>
+    defaultEffort?: string
+  }
+}
+
+interface LlmInfo {
+  id: string
+  name: string
+}
+
+interface LlmConfigEntry {
+  provider: string
+  displayName: string
+  settingsNs: string
+  settingsPath: readonly string[]
+  declared?: boolean
+}
+
+interface LlmModelInfo {
+  id: string
+  name: string
+}
+
 export interface HostContext {
   agents: { get(id: string): Agent | undefined }
-  llm: { stream(options: Record<string, unknown>): AsyncIterable<Record<string, unknown>> }
-  settings: { register(ns: string, schema: unknown, options?: unknown): SettingsScope }
+  llm: {
+    stream(options: Record<string, unknown>): AsyncIterable<Record<string, unknown>>
+    listProviders(): LlmInfo[]
+    listConfigurableProviders(): LlmConfigEntry[]
+    listModels(provider: string): Promise<LlmModelInfo[]>
+    resolveModelInfo(provider: string, model: string): Promise<ResolvedModelInfo>
+  }
+  settings: {
+    register(ns: string, schema: unknown, options?: unknown): SettingsScope
+    get(ns: string): unknown
+  }
   // Native same-session goal service (dsh-goal), listed in `inject`.
   goals: GoalService
   // Optional-service lookup for `connection` (see rpc.ts); undefined when absent.
   get?(name: string): unknown
-  logger?: { debug?(message: string, meta?: Record<string, unknown>): void }
+  logger?: {
+    debug?(message: string, meta?: Record<string, unknown>): void
+    info?(message: string, meta?: Record<string, unknown>): void
+  }
   on(event: string, listener: (...args: unknown[]) => unknown): unknown
   effect(factory: () => unknown, label?: string): void
 }
@@ -132,24 +186,128 @@ export function readAdviceFromBlocks(
   return undefined
 }
 
-/** Extract a create_goal objective from the advisor's streamed blocks. */
+/** Extract a set_goal objective from the keeper's streamed blocks. */
 export function readGoalFromBlocks(blocks: Array<Record<string, unknown>>): string | undefined {
   for (const block of blocks) {
-    const parsed = parseToolCall(block, 'create_goal')
+    const parsed = parseToolCall(block, 'set_goal')
     if (parsed && typeof parsed.objective === 'string' && parsed.objective.trim()) return parsed.objective.trim()
   }
   return undefined
 }
 
-/** Extract add_tasks task lines from the advisor's streamed blocks. */
+/** Detect a complete_goal call in the keeper's streamed blocks. */
+export function readCompleteFromBlocks(blocks: Array<Record<string, unknown>>): boolean {
+  for (const block of blocks) {
+    if (parseToolCall(block, 'complete_goal')) return true
+  }
+  return false
+}
+
+/** Extract update_tasks task lines from the keeper's streamed blocks. */
 export function readTasksFromBlocks(blocks: Array<Record<string, unknown>>): string[] {
   for (const block of blocks) {
-    const parsed = parseToolCall(block, 'add_tasks')
+    const parsed = parseToolCall(block, 'update_tasks')
     if (parsed && Array.isArray(parsed.tasks)) {
       return parsed.tasks.filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
     }
   }
   return []
+}
+
+/** One authenticated picker option surfaced through the `pickers` RPC. */
+interface PickerProvider {
+  provider: string
+  displayName: string
+  models: Array<{
+    id: string
+    name: string
+    efforts: Array<{ id: string; name: string }>
+  }>
+}
+
+/**
+ * Build the ready-to-render picker set: every registered provider whose
+ * authentication the credentials seam reports as configured, with each
+ * provider's models and each model's selectable reasoning efforts.
+ *
+ * "Authenticated" mirrors the official UI's `llm.providers` predicate: a
+ * provider is active iff its id is in `listProviders()` (an adapter currently
+ * owns the route). Additionally, when its `llm-pi-ai` profile names a
+ * credential reference (`apiKeyEnv`), the credential seam must describe it as
+ * configured — otherwise the provider is omitted, since a missing key would
+ * only surface as a downstream stream error. A provider that names no
+ * `apiKeyEnv` is considered authenticated if it is active.
+ */
+async function buildPickers(ctx: HostContext): Promise<PickerProvider[]> {
+  // ACTIVE ROUTE SET is authoritative: an id returned by `listProviders()` is a
+  // live, registered route in this harness — registration implies a usable
+  // (authenticated) route. Inactive routes (no adapter owns them yet) are still
+  // excluded below. The credentials seam REFINE, not GATE: it can only REMOVE a
+  // provider when it definitively returns `configured === false`; an absent,
+  // throwing, or malformed probe falls through to include (active route stands).
+  const registered = ctx.llm.listProviders()
+  const activeIds = new Set(registered.map((p) => p.id))
+  // Look up `apiKeyEnv` per provider from the resolved `llm-pi-ai` settings
+  // scope (path `providers.<route>.apiKeyEnv`). The LLM types do NOT carry
+  // `apiKeyEnv`, so this is the typed seam to the profile.
+  const piAiRaw = ctx.settings.get('llm-pi-ai') as
+    | { providers?: Record<string, { apiKeyEnv?: string }> }
+    | undefined
+  const piAiProviders = piAiRaw?.providers ?? {}
+  const credentials = typeof ctx.get === 'function' ? ctx.get('credentials') : undefined
+  const describe = (
+    credentials as { describe?: (ref: string) => Promise<{ configured: boolean }> } | undefined
+  )?.describe
+
+  const providers: PickerProvider[] = []
+  for (const entry of ctx.llm.listConfigurableProviders()) {
+    if (!activeIds.has(entry.provider)) continue
+    const apiKeyEnv = piAiProviders[entry.provider]?.apiKeyEnv
+    if (apiKeyEnv && typeof describe === 'function') {
+      try {
+        const info = await describe(apiKeyEnv)
+        if (info && typeof info === 'object' && info.configured === false) {
+          // POSITIVE proof the provider is unconfigured — the only path that
+          // may remove an active route. Logged so the journal shows why.
+          ctx.logger?.info?.(`${PLUGIN_NAME}: picker excludes ${entry.provider} (${apiKeyEnv} reports not-configured)`)
+          continue
+        }
+        // describe returned undefined, malformed, or configured:true → fall
+        // through and INCLUDE on active-route basis.
+      } catch {
+        // describe threw — can't positively prove unconfigured → INCLUDE on
+        // active-route basis (logged once below if probe is absent entirely).
+      }
+    } else if (apiKeyEnv && typeof describe !== 'function') {
+      // Credentials probe unavailable entirely; active route still stands.
+      ctx.logger?.info?.(`${PLUGIN_NAME}: credentials probe unavailable, including active provider ${entry.provider} on active-route basis`)
+    }
+    let models: LlmModelInfo[]
+    try {
+      models = await ctx.llm.listModels(entry.provider)
+    } catch {
+      models = []
+    }
+    const enriched = await Promise.all(
+      models.map(async (m) => {
+        let efforts: Array<{ id: string; name: string }> = []
+        try {
+          const resolved = await ctx.llm.resolveModelInfo(entry.provider, m.id)
+          efforts = (resolved.reasoning?.efforts ?? []).map((e) => ({
+            id: e.id,
+            name: e.name || e.id,
+          }))
+        } catch {
+          // Adapter refused to resolve: leave the model with no efforts so the
+          // picker still offers it but the effort dropdown falls back to the
+          // "Default (unspecified)" option only.
+        }
+        return { id: m.id, name: m.name, efforts }
+      }),
+    )
+    providers.push({ provider: entry.provider, displayName: entry.displayName, models: enriched })
+  }
+  return providers
 }
 
 export function apply(ctx: HostContext): void {
@@ -175,6 +333,7 @@ export function apply(ctx: HostContext): void {
         },
         status: (sessionId) =>
           sessionId ? [activity.snapshot(sessionId)] : activity.all(),
+        pickers: () => buildPickers(ctx),
       }),
     `${PLUGIN_NAME}: config rpc`,
   )
@@ -209,15 +368,15 @@ export function apply(ctx: HostContext): void {
       const tools: Array<Record<string, unknown>> = [ADVISE_TOOL]
       const extraPrompt: string[] = []
       if (config.createGoals) {
-        tools.push(CREATE_GOAL_TOOL)
+        tools.push(SET_GOAL_TOOL, COMPLETE_GOAL_TOOL)
         extraPrompt.push(
-          'If the session has a clear overarching objective the agent should be held to, call `create_goal` once.',
+          "Call `set_goal` when the user's request implies a single overarching objective the agent should be held to across the session (e.g. build X, migrate Y, get the suite green). It creates the goal or updates the objective if one exists, so keep it current as the true objective sharpens. Skip trivial one-shot asks. Call `complete_goal` only when that objective is genuinely finished and verified.",
         )
       }
       if (config.createTasks) {
-        tools.push(ADD_TASKS_TOOL)
+        tools.push(UPDATE_TASKS_TOOL)
         extraPrompt.push(
-          'If the work has concrete steps the agent has not tracked, call `add_tasks` to add them to its checklist.',
+          "Call `update_tasks` whenever the work has concrete, separable steps the agent has not written into its own checklist. Add the missing steps as short imperative lines; they are appended, never replacing the agent's todos, so do not repeat steps it already tracks.",
         )
       }
 
@@ -254,15 +413,24 @@ export function apply(ctx: HostContext): void {
       }
       activity.setLastError(sessionId, undefined)
 
-      // Native goal creation (direct): set the session goal through ctx.goals.
+      // Native goal drive (direct): set/update the objective, and complete the
+      // goal when the keeper judges it done. setGoal creates when no goal
+      // exists and edits the objective otherwise (no more silent no-op).
       if (config.createGoals) {
         const objective = readGoalFromBlocks(blocks)
         if (objective) {
           try {
-            createGoal(ctx.goals, agent, objective)
-            activity.goalCreated(sessionId, objective)
+            const view = setGoal(ctx.goals, agent, objective)
+            if (view) activity.goalCreated(sessionId, objective)
           } catch (error) {
-            ctx.logger?.debug?.(`${PLUGIN_NAME}: create_goal failed`, { session: sessionId, error: String(error) })
+            ctx.logger?.debug?.(`${PLUGIN_NAME}: set_goal failed`, { session: sessionId, error: String(error) })
+          }
+        }
+        if (readCompleteFromBlocks(blocks)) {
+          try {
+            completeGoal(ctx.goals, agent)
+          } catch (error) {
+            ctx.logger?.debug?.(`${PLUGIN_NAME}: complete_goal failed`, { session: sessionId, error: String(error) })
           }
         }
       }
@@ -277,7 +445,7 @@ export function apply(ctx: HostContext): void {
             // Record what we asked to add (addTasks dedupes against existing).
             for (const task of tasks) activity.taskCreated(sessionId, task)
           } catch (error) {
-            ctx.logger?.debug?.(`${PLUGIN_NAME}: add_tasks failed`, { session: sessionId, error: String(error) })
+            ctx.logger?.debug?.(`${PLUGIN_NAME}: update_tasks failed`, { session: sessionId, error: String(error) })
           }
         }
       }
@@ -295,7 +463,7 @@ export function apply(ctx: HostContext): void {
           content: [
             {
               type: 'text',
-              text: `<advisory advisor="mini-advisor" severity="${advice.severity}" guidance="weigh, don't blindly obey">\n${advice.note}\n</advisory>`,
+              text: `<advisory advisor="goal-keeper" severity="${advice.severity}" guidance="weigh, don't blindly obey">\n${advice.note}\n</advisory>`,
             },
           ],
           source: { kind: 'plugin', plugin: PLUGIN_NAME },

@@ -1,9 +1,11 @@
 /**
- * The `/dsh-mini-advisor` RPC channel: the transport the Settings tab and the
+ * The `/dsh-goal-keeper` RPC channel: the transport the Settings tab and the
  * sidebar tab use. Endpoints:
  *   get     {}            -> the current normalized config
  *   update  {patch}       -> merge a partial config; returns the normalized result
- *   status  {sessionId?}  -> per-session advisor activity (one session or all)
+ *   status  {sessionId?}  -> per-session keeper activity (one session or all)
+ *   pickers {}            -> authenticated providers, their models, and per-model
+ *                            reasoning efforts, ready to render locked selects
  *
  * Contract notes (dsh-client-connection):
  *  - `rpc.handle` REQUIRES the options argument; `authority` is read unguarded.
@@ -23,11 +25,24 @@ export const RPC_CHANNEL = `/${PLUGIN_NAME}`
 
 type RpcResult = { ok: true; value: unknown } | { ok: false; error: { code: string; message: string } }
 
+/** One picker option surfaced to the Settings tab. */
+export interface PickerProvider {
+  provider: string
+  displayName: string
+  models: Array<{
+    id: string
+    name: string
+    efforts: Array<{ id: string; name: string }>
+  }>
+}
+
 export interface ConfigStore {
   get(): Config
   update(patch: Record<string, unknown>): Config
   /** Per-session activity: one session's when an id is given, else all sessions. */
   status(sessionId?: string): SessionActivity[]
+  /** Authenticated providers with their models and per-model reasoning efforts. */
+  pickers(): Promise<PickerProvider[]>
 }
 
 interface ConnectionService {
@@ -88,6 +103,8 @@ export function registerConfigRpc(ctx: ConnectionHost, store: ConfigStore): () =
               return { ok: false, error: { code: 'bad-request', message: String((error as Error).message) } }
             }
           }
+          case 'pickers':
+            return { ok: true, value: { providers: await store.pickers() } }
           default:
             return { ok: false, error: { code: 'bad-request', message: `unknown endpoint: ${endpoint}` } }
         }

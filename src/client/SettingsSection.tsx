@@ -1,12 +1,19 @@
 /**
- * The "Mini Advisor" settings section: a small form over this plugin's config,
- * backed by the `/dsh-mini-advisor` RPC channel.
+ * The "Goal Keeper" settings section: a small form over this plugin's config,
+ * backed by the `/dsh-goal-keeper` RPC channel.
  *
  * Reads AND writes ride the plugin's own RPC channel instead of
  * `ctx.settingsScope`: DSH keeps settingsScope persistence loopback-only
  * (remote browsers get a process-local scope whose snapshot is permanently
  * `unavailable`, which would hide this whole section), while the channel's
  * trusted-host fence works anywhere the GUI works.
+ *
+ * Provider / model / reasoningEffort are LOCKED `<select>` dropdowns auto-
+ * populated from the host's `pickers` endpoint, so the user can only pick
+ * values the runtime can actually serve. A value the saved config still
+ * holds but the host no longer authenticates is shown as a disabled-looking
+ * sentinel option (no silent drop), and any select that has no real options
+ * is disabled until pickers load.
  */
 import * as React from 'react'
 import { RPC_CHANNEL } from '../rpc'
@@ -22,6 +29,18 @@ interface ConfigView {
   minDeltaChars: number
   createGoals: boolean
   createTasks: boolean
+}
+
+interface PickerModel {
+  id: string
+  name: string
+  efforts: Array<{ id: string; name: string }>
+}
+
+interface PickerProvider {
+  provider: string
+  displayName: string
+  models: PickerModel[]
 }
 
 interface ClientCtx {
@@ -54,8 +73,9 @@ const styles: Record<string, React.CSSProperties> = {
 }
 
 export function createSettingsSection(ctx: ClientCtx): React.ComponentType<{ close?: () => void }> {
-  return function MiniAdvisorSettingsSection() {
+  return function GoalKeeperSettingsSection() {
     const [config, setConfig] = useState<ConfigView | null>(null)
+    const [providers, setProviders] = useState<PickerProvider[]>([])
     const [status, setStatus] = useState('')
     const [saving, setSaving] = useState(false)
 
@@ -70,9 +90,23 @@ export function createSettingsSection(ctx: ClientCtx): React.ComponentType<{ clo
       }
     }, [])
 
+    const loadPickers = useCallback(async () => {
+      try {
+        const res = await ctx.connection.rpc.call(RPC_CHANNEL, 'pickers', {})
+        const { providers } = unwrap<{ providers: PickerProvider[] }>(res, 'pickers')
+        setProviders(Array.isArray(providers) ? providers : [])
+      } catch (error) {
+        // Picker load failure: leave the locked selects empty; the default
+        // sentinel options still display the saved value so nothing mutates.
+        setProviders([])
+        setStatus(`pickers: ${String((error as Error).message)}`)
+      }
+    }, [])
+
     useEffect(() => {
       void load()
-    }, [load])
+      void loadPickers()
+    }, [load, loadPickers])
 
     const save = useCallback(async () => {
       if (!config) return
@@ -96,6 +130,52 @@ export function createSettingsSection(ctx: ClientCtx): React.ComponentType<{ clo
 
     const patch = (next: Partial<ConfigView>): void => setConfig({ ...config, ...next })
 
+    // The currently-saved provider/model may be unauthenticated (e.g. live value
+    // points at a route whose key is gone). Show it as a disabled-looking
+    // sentinel so the saved value is visible without being silently dropped.
+    const authenticatedProvider = providers.find((p) => p.provider === config.provider)
+    const providerOptions: Array<{ value: string; label: string; disabled?: boolean }> = []
+    if (!authenticatedProvider && config.provider) {
+      providerOptions.push({ value: config.provider, label: `${config.provider} (current — not authenticated)`, disabled: true })
+    }
+    for (const p of providers) {
+      providerOptions.push({ value: p.provider, label: p.displayName })
+    }
+
+    const modelsForProvider = authenticatedProvider?.models ?? []
+    const authenticatedModel = modelsForProvider.find((m) => m.id === config.model)
+    const modelOptions: Array<{ value: string; label: string; disabled?: boolean }> = []
+    if (!authenticatedModel && config.model) {
+      modelOptions.push({
+        value: config.model,
+        label: authenticatedProvider
+          ? `${config.model} (current — not in catalog)`
+          : `${config.model} (current — provider not authenticated)`,
+        disabled: true,
+      })
+    }
+    for (const m of modelsForProvider) {
+      modelOptions.push({ value: m.id, label: m.name })
+    }
+
+    const effortsForModel = authenticatedModel?.efforts ?? []
+    const effortOptions: Array<{ value: string; label: string; disabled?: boolean }> = [
+      { value: '', label: 'Default (unspecified)' },
+    ]
+    for (const e of effortsForModel) {
+      effortOptions.push({ value: e.id, label: e.name })
+    }
+    if (
+      config.reasoningEffort &&
+      !effortsForModel.some((e) => e.id === config.reasoningEffort)
+    ) {
+      effortOptions.push({
+        value: config.reasoningEffort,
+        label: `${config.reasoningEffort} (current — not supported)`,
+        disabled: true,
+      })
+    }
+
     return (
       <div style={styles.root}>
         <label style={styles.toggle}>
@@ -106,30 +186,75 @@ export function createSettingsSection(ctx: ClientCtx): React.ComponentType<{ clo
 
         <div style={styles.row}>
           <span style={styles.label}>Provider</span>
-          <input style={styles.input} value={config.provider} onChange={(e) => patch({ provider: e.target.value })} />
-          <span style={styles.hint}>LLM provider route for the advisor model.</span>
+          <select
+            style={styles.input}
+            value={config.provider}
+            onChange={(e) => {
+              const next = providers.find((p) => p.provider === e.target.value)
+              if (!next) return
+              const firstModel = next.models[0]
+              patch({
+                provider: next.provider,
+                model: firstModel?.id ?? '',
+                reasoningEffort: '',
+              })
+            }}
+          >
+            {providerOptions.map((o) => (
+              <option key={o.value} value={o.value} disabled={o.disabled}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+          <span style={styles.hint}>LLM provider route for the keeper model (only authenticated providers listed).</span>
         </div>
 
         <div style={styles.row}>
           <span style={styles.label}>Model</span>
-          <input style={styles.input} value={config.model} onChange={(e) => patch({ model: e.target.value })} />
-          <span style={styles.hint}>Advisor model id from the DSH model list.</span>
+          <select
+            style={styles.input}
+            value={config.model}
+            onChange={(e) => {
+              const nextModel = modelsForProvider.find((m) => m.id === e.target.value)
+              if (!nextModel) return
+              const efforts = nextModel.efforts.map((x) => x.id)
+              patch({
+                model: nextModel.id,
+                reasoningEffort: efforts.includes(config.reasoningEffort) ? config.reasoningEffort : '',
+              })
+            }}
+            disabled={!authenticatedProvider}
+          >
+            {modelOptions.map((o) => (
+              <option key={o.value} value={o.value} disabled={o.disabled}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+          <span style={styles.hint}>Keeper model id from the DSH model list.</span>
         </div>
 
         <div style={styles.row}>
           <span style={styles.label}>Reasoning effort</span>
-          <input
+          <select
             style={styles.input}
             value={config.reasoningEffort}
             onChange={(e) => patch({ reasoningEffort: e.target.value })}
-          />
-          <span style={styles.hint}>Optional; leave blank for the model default.</span>
+            disabled={!authenticatedModel}
+          >
+            {effortOptions.map((o) => (
+              <option key={o.value} value={o.value} disabled={o.disabled}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+          <span style={styles.hint}>Optional; pick the model default with “Default (unspecified)”.</span>
         </div>
 
         <div style={styles.row}>
           <span style={styles.label}>Persona</span>
           <textarea style={styles.textarea} value={config.persona} onChange={(e) => patch({ persona: e.target.value })} />
-          <span style={styles.hint}>The advisor's reviewing instructions.</span>
+          <span style={styles.hint}>The keeper's reviewing instructions.</span>
         </div>
 
         <div style={styles.row}>
@@ -151,7 +276,7 @@ export function createSettingsSection(ctx: ClientCtx): React.ComponentType<{ clo
             onChange={(e) => patch({ createGoals: e.target.checked })}
           />
           <span style={styles.label}>Create goals</span>
-          <span style={styles.hint}>Let the advisor set the session goal directly.</span>
+          <span style={styles.hint}>Let the keeper set, update, and complete the session goal directly.</span>
         </label>
 
         <label style={styles.toggle}>
@@ -161,7 +286,7 @@ export function createSettingsSection(ctx: ClientCtx): React.ComponentType<{ clo
             onChange={(e) => patch({ createTasks: e.target.checked })}
           />
           <span style={styles.label}>Create tasks</span>
-          <span style={styles.hint}>Let the advisor add tasks to the todo checklist.</span>
+          <span style={styles.hint}>Let the keeper add tasks to the todo checklist directly.</span>
         </label>
 
         <div style={styles.footer}>
