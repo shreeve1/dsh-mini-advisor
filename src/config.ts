@@ -12,9 +12,11 @@ export interface Config {
   persona: string
   /** Skip a review when the rendered transcript delta is shorter than this. */
   minDeltaChars: number
-  /** Let the advisor create a native session goal directly. */
+  /** Also review mid-turn every N steps; 0 reviews only at turn boundaries. */
+  reviewEverySteps: number
+  /** Let the keeper create a native session goal directly. */
   createGoals: boolean
-  /** Let the advisor add tasks to the agent's todo checklist directly. */
+  /** Let the keeper add tasks to the agent's todo checklist directly. */
   createTasks: boolean
 }
 
@@ -26,18 +28,24 @@ export const Config: Schema<Config> = Schema.object({
   persona: Schema.string()
     .role('textarea')
     .default(
-      'You are a rigorous second reviewer watching a coding agent. Speak up only when something matters: a bug, a security hole, a wrong turn, or a premature "done". Keep advice concrete and short.',
+      'You are a rigorous goal-keeper watching a coding agent. Speak up only when something matters: a bug, a security hole, a wrong turn, or a premature "done". Keep advice concrete and short.',
     )
     .description("The advisor's persona and reviewing instructions."),
   minDeltaChars: Schema.number()
     .default(40)
     .description('Skip a review when the rendered transcript delta is shorter than this many characters.'),
+  reviewEverySteps: Schema.number()
+    .min(0)
+    .default(12)
+    .description(
+      'Also review mid-turn every N agent steps, so advice can land while a long turn is still running. 0 = review only at turn boundaries.',
+    ),
   createGoals: Schema.boolean()
     .default(true)
-    .description('Let the advisor set the session goal directly (native goal service).'),
+    .description('Let the keeper set, update, and complete the session goal directly (native goal service).'),
   createTasks: Schema.boolean()
     .default(true)
-    .description("Let the advisor add tasks to the agent's todo checklist directly."),
+    .description("Let the keeper add tasks to the agent's todo checklist directly."),
 })
 
 /**

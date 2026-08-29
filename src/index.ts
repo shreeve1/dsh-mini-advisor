@@ -27,12 +27,31 @@ export { RPC_CHANNEL }
  */
 export const SETTINGS_NAMESPACE = 'dsh-mini-advisor'
 
+/**
+ * Harness mechanics the advisor must not get wrong. The advisor model reviews a
+ * dsh transcript but has no dsh knowledge of its own, so without these it invents
+ * plausible-sounding remedies — e.g. recommending `job_output <subagent_id>` to
+ * drain a continuable subagent, which is not a job and has no job output. Wrong
+ * advice delivered confidently is worse than silence, so state the few mechanics
+ * that advisories most often turn on.
+ */
+const HARNESS_FACTS = [
+  'Facts about this harness — advise within them, and never invent a tool or capability not listed here:',
+  '- Subagents and jobs are different things. `subagent` / `subagent_fork` / `delegate_*` create continuable SUBAGENTS, observed with `list_agents` and `peek_subagent`. `job_output` / `job_list` work only on dsh JOBS (background bash, background-mode runs) and do NOT work on subagents — never advise draining a subagent with `job_output`.',
+  '- `send_message` QUEUES a turn on a subagent: it is delivered only after the child\'s current turn ends, so it cannot redirect work already underway.',
+  '- `interrupt_agent` cancels a child\'s CURRENT turn only. It does not extract a final report, and queued messages stay parked. A child given no stopping condition may never emit a report at all — the fix is to re-delegate with a hard tool-call budget, not to nudge or interrupt again.',
+  '- `peek_subagent` is a passive read. A rising event count means the child is alive, not that it is progressing.',
+  '- Ending a turn while subagents run is CORRECT: the runtime wakes the agent with a settlement notice. Waiting is a legitimate action; never advise polling in a loop to stay busy.',
+].join('\n')
+
 const SYSTEM_PROMPT_TAIL = [
   'You are a goal-keeper watching the latest slice of a coding-agent transcript below.',
   'Your job is to keep the primary agent on track toward its objective until it is genuinely done.',
-  'Use every tool that applies this turn, not just one — the tools are independent, and more than one can fire in the same review.',
+  'The tools below are independent and more than one kind can fire in the same review (e.g. `advise` plus `update_tasks`) — but call `advise` at most once: pick the single most important thing and say only that, rather than bundling several concerns into one note.',
   'When something matters — a bug, a security hole, a wrong turn, or a premature "done" — call the `advise` tool with a short, concrete note and a severity (nit | concern | blocker).',
   'If nothing needs any tool, reply "ok".',
+  '',
+  HARNESS_FACTS,
 ].join('\n')
 
 const ADVISE_TOOL = {
@@ -52,7 +71,7 @@ const ADVISE_TOOL = {
 const SET_GOAL_TOOL = {
   name: 'set_goal',
   description:
-    "Set or update the session's overarching objective when the user's ask has a clear goal the agent should be held to. Creates the goal if none exists, or revises the objective if one already does. One goal per session; keep it current as the work's true objective becomes clearer.",
+    "Set or update the session's overarching objective when the user's ask has a clear goal the agent should be held to. Creates the goal if none exists, or revises the objective if one already does. One goal per session. Revise only to reflect what the USER has actually asked for or confirmed — never to narrow a problem the user stated into a specific solution they have not chosen, and never to bake in the agent's current approach, findings, or environment details. If the user named a problem and the objective names an implementation, that is drift: leave the objective alone. When the user's ask is to investigate, compare, or decide, the objective is the deciding — do not rewrite it into building whichever option is currently in favour.",
   parameters: {
     type: 'object',
     properties: {
@@ -344,9 +363,19 @@ export function apply(ctx: HostContext): void {
   const cursors = new Map<string, number>()
   const updateIndexes = new Map<string, number>()
   const reviewing = new Set<string>()
+  // Sessions that have been disposed. A `turn/end` can be observed as a session
+  // winds down; without this guard a review would run against a disposed
+  // session, incrementing the advice counter while `agent.inject` lands nowhere
+  // durable (phantom advice). Reviews are skipped once a session is disposed.
+  const disposed = new Set<string>()
+  // Steps observed in the current turn, per session, for the in-turn trigger.
+  // Reset at every turn boundary so the count is always "steps into this turn".
+  const stepsThisTurn = new Map<string, number>()
+  // Last advisory note injected per session, to suppress immediate repeats.
+  const lastAdviceNotes = new Map<string, string>()
 
   const review = async (sessionId: string): Promise<void> => {
-    if (!config.enabled || reviewing.has(sessionId)) return
+    if (!config.enabled || disposed.has(sessionId) || reviewing.has(sessionId)) return
     const agent = ctx.agents.get(sessionId)
     const events = agent?.session?.events
     if (!agent || !events) return
@@ -452,12 +481,29 @@ export function apply(ctx: HostContext): void {
 
       const advice = readAdviceFromBlocks(blocks)
       if (!advice) return
-      activity.adviceIssued(sessionId, advice.severity, advice.note)
+
+      // If the session was disposed while this review was in flight, skip the
+      // inject entirely — otherwise the advisory lands nowhere durable and the
+      // counter would record phantom advice the session never received.
+      if (disposed.has(sessionId)) return
+
+      // Drop an advisory identical to the last one this session received. Reviews
+      // now also run mid-turn, so a genuinely stuck agent gets reviewed several
+      // times while the transcript still shows the same problem — and the advisor
+      // rightly reaches the same conclusion each time. Injecting it repeatedly
+      // would turn one useful warning into nagging the agent learns to ignore.
+      // Comparing the note text keeps the first occurrence and suppresses echoes,
+      // while any genuinely new observation still gets through.
+      const noteKey = advice.note.trim()
+      if (lastAdviceNotes.get(sessionId) === noteKey) return
+      lastAdviceNotes.set(sessionId, noteKey)
 
       // The advisory is model-visible input, so it must be a logged user-role
       // message with a typed plugin source — `createUserMessage` + `inject`
       // handle the durable `user/message` event for us (guide: model-visible ⟺
-      // logged). The primary agent weighs it; it is never an order.
+      // logged). The primary agent weighs it; it is never an order. Only count
+      // the advice once the inject has been issued without throwing, so the
+      // sidebar counter never diverges from what actually reached the session.
       agent.inject(
         createUserMessage({
           content: [
@@ -469,6 +515,7 @@ export function apply(ctx: HostContext): void {
           source: { kind: 'plugin', plugin: PLUGIN_NAME },
         }),
       )
+      activity.adviceIssued(sessionId, advice.severity, advice.note)
     } catch (error) {
       activity.setLastError(sessionId, String(error instanceof Error ? error.message : error))
       ctx.logger?.debug?.(`${PLUGIN_NAME}: review failed`, { session: sessionId, error: String(error) })
@@ -480,16 +527,39 @@ export function apply(ctx: HostContext): void {
   // Watch the durable transcript stream for turn boundaries. `session/event`
   // is the documented replay-data consumer path; a `turn/end` marks a complete
   // unit of the primary agent's work to review (agent-lifecycle.md).
+  // A `turn/end` marks a complete unit of work, but a single turn can run for
+  // dozens of steps — long enough for the agent to spend an entire turn stuck in
+  // a loop with the keeper unable to say a word until the damage is done. So we
+  // also review mid-turn, every `reviewEverySteps` steps, which is the only way
+  // advice can land while a runaway turn is still running. `reviewing` already
+  // serializes overlapping reviews and the cursor only moves forward, so an
+  // in-turn review costs the turn/end review nothing but the events it consumed.
   ctx.on('session/event', (session: unknown, event: unknown) => {
-    if ((event as SessionEvent)?.type !== 'turn/end') return
-    void review(sessionIdOf(session))
+    const type = (event as SessionEvent)?.type
+    const sessionId = sessionIdOf(session)
+
+    if (type === 'turn/start' || type === 'turn/end') {
+      stepsThisTurn.delete(sessionId)
+      if (type === 'turn/end') void review(sessionId)
+      return
+    }
+
+    if (type !== 'step/end') return
+    const every = config.reviewEverySteps
+    if (every <= 0) return // 0 disables the in-turn trigger: turn/end only.
+    const steps = (stepsThisTurn.get(sessionId) ?? 0) + 1
+    stepsThisTurn.set(sessionId, steps)
+    if (steps % every === 0) void review(sessionId)
   })
 
   ctx.on('session/disposed', (session: unknown) => {
     const id = sessionIdOf(session)
+    disposed.add(id)
     cursors.delete(id)
     updateIndexes.delete(id)
     reviewing.delete(id)
+    stepsThisTurn.delete(id)
+    lastAdviceNotes.delete(id)
     activity.drop(id)
   })
 }

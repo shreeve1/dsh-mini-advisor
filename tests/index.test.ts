@@ -28,11 +28,67 @@ describe('renderDelta', () => {
     expect(nextCursor).toBe(events.length)
   })
 
-  it('skips the advisor plugin own messages so it never re-reviews itself', () => {
+  it('elides repeated chunks of one tool into a counted summary', () => {
+    // A poll loop otherwise fills the delta with near-identical chunks, which is
+    // both expensive and hides the very pattern most worth advising on.
+    const poll = []
+    for (let i = 0; i < 20; i++) {
+      poll.push({ type: 'tool/call', data: { name: 'peek_subagent', callId: `p${i}`, arguments: '{"childId":"abc"}' } })
+    }
+    const { text } = renderDelta(poll, 0, 1)
+    expect(text).toContain('peek_subagent repeated — 20 chunks total')
+    expect(text).toContain('16 further occurrences elided')
+    expect(text.match(/### Tool call: peek_subagent/g)).toHaveLength(4)
+  })
+
+  it('elides a poll loop even when the calls are not adjacent', () => {
+    // The real failure shape, measured from a live session: the agent alternates
+    // between two children and narrates between calls, so NO run of identical
+    // adjacent calls ever forms. A per-run collapse misses this entirely — 94
+    // peeks produced zero adjacent runs longer than 5 — so the budget is per
+    // tool across the whole update.
+    const interleaved = []
+    for (let i = 0; i < 12; i++) {
+      interleaved.push({ type: 'tool/call', data: { name: 'peek_subagent', callId: `a${i}` } })
+      interleaved.push({ type: 'tool/call', data: { name: 'peek_subagent', callId: `b${i}` } })
+      interleaved.push({
+        type: 'assistant/message',
+        data: { message: { content: [{ type: 'text', text: 'still waiting' }] } },
+      })
+    }
+    const { text } = renderDelta(interleaved, 0, 1)
+    expect(text).toContain('peek_subagent repeated — 24 chunks total')
+    // Narration is never elided — it is where the agent's intent shows.
+    expect(text.match(/### Assistant/g)).toHaveLength(12)
+  })
+
+  it('leaves a small number of chunks fully expanded', () => {
+    const few = [
+      { type: 'tool/call', data: { name: 'read', callId: 'a', arguments: '{"p":"1"}' } },
+      { type: 'tool/call', data: { name: 'read', callId: 'b', arguments: '{"p":"2"}' } },
+    ]
+    const { text } = renderDelta(few, 0, 1)
+    expect(text).not.toContain('elided')
+    expect(text.match(/### Tool call: read/g)).toHaveLength(2)
+  })
+
+  it('budgets each tool independently', () => {
+    // Ten reads must not consume the budget bash chunks need.
+    const mixed = []
+    for (let i = 0; i < 10; i++) {
+      mixed.push({ type: 'tool/call', data: { name: i % 2 === 0 ? 'read' : 'bash', callId: `m${i}` } })
+    }
+    const { text } = renderDelta(mixed, 0, 1)
+    expect(text.match(/### Tool call: read/g)).toHaveLength(4)
+    expect(text.match(/### Tool call: bash/g)).toHaveLength(4)
+    expect(text.match(/repeated —/g)).toHaveLength(2)
+  })
+
+  it('skips the keeper plugin own messages so it never re-reviews itself', () => {
     const own = [
       {
         type: 'user/message',
-        data: { content: [{ type: 'text', text: 'note' }], source: { kind: 'plugin', plugin: 'dsh-mini-advisor' } },
+        data: { content: [{ type: 'text', text: 'note' }], source: { kind: 'plugin', plugin: 'dsh-goal-keeper' } },
       },
     ]
     expect(renderDelta(own, 0, 1).text).toBe('')
@@ -99,19 +155,26 @@ describe('ActivityStore', () => {
 })
 
 import { addTasks, currentTodos } from '../src/goal-tasks'
-import { readGoalFromBlocks, readTasksFromBlocks } from '../src/index'
+import { readCompleteFromBlocks, readGoalFromBlocks, readTasksFromBlocks } from '../src/index'
 
 describe('goal/task block readers', () => {
-  it('reads a create_goal objective', () => {
-    const blocks = [{ type: 'tool-call', name: 'create_goal', arguments: '{"objective":"ship the login flow"}' }]
+  it('reads a set_goal objective', () => {
+    const blocks = [{ type: 'tool-call', name: 'set_goal', arguments: '{"objective":"ship the login flow"}' }]
     expect(readGoalFromBlocks(blocks)).toBe('ship the login flow')
   })
   it('returns undefined when no goal call', () => {
     expect(readGoalFromBlocks([{ type: 'text', text: 'ok' }])).toBeUndefined()
   })
-  it('reads add_tasks task lines and drops non-strings/blanks', () => {
-    const blocks = [{ type: 'tool-call', name: 'add_tasks', arguments: '{"tasks":["a","",2,"b"]}' }]
+  it('reads update_tasks task lines and drops non-strings/blanks', () => {
+    const blocks = [{ type: 'tool-call', name: 'update_tasks', arguments: '{"tasks":["a","",2,"b"]}' }]
     expect(readTasksFromBlocks(blocks)).toEqual(['a', 'b'])
+  })
+  it('detects a complete_goal call', () => {
+    const blocks = [{ type: 'tool-call', name: 'complete_goal', arguments: '{}' }]
+    expect(readCompleteFromBlocks(blocks)).toBe(true)
+  })
+  it('returns false when no complete_goal call', () => {
+    expect(readCompleteFromBlocks([{ type: 'text', text: 'ok' }])).toBe(false)
   })
 })
 

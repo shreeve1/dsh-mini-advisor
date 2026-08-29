@@ -3,7 +3,7 @@
 // the session's durable event list (rebuilt via `agent.session`), so the
 // renderer walks events past an index cursor and never re-reads history twice.
 
-export const PLUGIN_NAME = 'dsh-mini-advisor'
+export const PLUGIN_NAME = 'dsh-goal-keeper'
 
 /** Bound for one rendered field so a huge tool result cannot flood the advisor. */
 const TEXT_PREVIEW_LIMIT = 2000
@@ -44,9 +44,59 @@ function isOwnPluginMessage(data: unknown): boolean {
   return source?.kind === 'plugin' && source?.plugin === PLUGIN_NAME
 }
 
+/** A rendered chunk plus the tool it belongs to, so identical runs can collapse. */
+interface Section {
+  text: string
+  /** Tool name when this chunk is a tool call/result; undefined for prose. */
+  tool?: string
+}
+
+/** Chunks kept per tool before the rest are elided into one summary line. */
+const COLLAPSE_KEEP_PER_TOOL = 4
+
+/**
+ * Elide repetitive tool chatter, keeping the first few chunks per tool.
+ *
+ * A poll loop otherwise fills the delta with near-identical chunks: expensive to
+ * send, and the repetition hides the very pattern worth advising on. Collapsing
+ * *adjacent* runs is not enough — measured against a real 56-step poll loop, 94
+ * `peek_subagent` calls produced ZERO adjacent runs longer than 5, because the
+ * agent alternated between two children and narrated between calls. So the budget
+ * is per tool across the whole delta, not per consecutive run: the first few
+ * chunks of each tool survive, the rest become one counted summary. Prose is
+ * never elided, and every other tool keeps its own independent budget.
+ */
+function collapseRuns(sections: readonly Section[]): string[] {
+  const total = new Map<string, number>()
+  for (const section of sections) {
+    if (section.tool !== undefined) total.set(section.tool, (total.get(section.tool) ?? 0) + 1)
+  }
+
+  const out: string[] = []
+  const seen = new Map<string, number>()
+  for (const section of sections) {
+    const tool = section.tool
+    if (tool === undefined) {
+      out.push(section.text)
+      continue
+    }
+    const count = (seen.get(tool) ?? 0) + 1
+    seen.set(tool, count)
+    const totalForTool = total.get(tool) ?? 0
+    if (count <= COLLAPSE_KEEP_PER_TOOL) {
+      out.push(section.text)
+    } else if (count === COLLAPSE_KEEP_PER_TOOL + 1 && totalForTool > COLLAPSE_KEEP_PER_TOOL) {
+      out.push(
+        `### … ${tool} repeated — ${totalForTool} chunks total in this update, ${totalForTool - COLLAPSE_KEEP_PER_TOOL} further occurrences elided …`,
+      )
+    }
+  }
+  return out
+}
+
 /** Render session events in `[cursor, events.length)` as one advisor update. */
 export function renderDelta(events: readonly SessionEvent[], cursor: number, updateIndex: number): RenderedDelta {
-  const sections: string[] = []
+  const sections: Section[] = []
   const toolNames = new Map<string, string>()
   let index = Math.max(0, cursor)
 
@@ -59,13 +109,13 @@ export function renderDelta(events: readonly SessionEvent[], cursor: number, upd
       case 'user/message': {
         if (isOwnPluginMessage(data)) break // never re-review our own advisories
         const text = blocksToText(data.content)
-        if (text.trim()) sections.push(`### User\n${truncate(text, TEXT_PREVIEW_LIMIT)}`)
+        if (text.trim()) sections.push({ text: `### User\n${truncate(text, TEXT_PREVIEW_LIMIT)}` })
         break
       }
       case 'assistant/message': {
         const message = data.message as { content?: unknown } | undefined
         const text = blocksToText(message?.content)
-        if (text.trim()) sections.push(`### Assistant\n${truncate(text, TEXT_PREVIEW_LIMIT)}`)
+        if (text.trim()) sections.push({ text: `### Assistant\n${truncate(text, TEXT_PREVIEW_LIMIT)}` })
         break
       }
       case 'tool/call': {
@@ -76,7 +126,7 @@ export function renderDelta(events: readonly SessionEvent[], cursor: number, upd
         if (typeof args === 'string' && args.trim() && args.trim() !== '{}') {
           argsPreview = `\n\`\`\`json\n${truncate(args, ARGS_PREVIEW_LIMIT)}\n\`\`\``
         }
-        sections.push(`### Tool call: ${name}${argsPreview}`)
+        sections.push({ text: `### Tool call: ${name}${argsPreview}`, tool: name })
         break
       }
       case 'tool/result': {
@@ -87,7 +137,7 @@ export function renderDelta(events: readonly SessionEvent[], cursor: number, upd
         const isError = data.error !== undefined
         const status = isError ? ' (error)' : ''
         const body = text.trim() ? truncate(text, TEXT_PREVIEW_LIMIT) : '(no output)'
-        sections.push(`### Tool result: ${name}${status}\n${body}`)
+        sections.push({ text: `### Tool result: ${name}${status}\n${body}`, tool: name })
         break
       }
       default:
@@ -96,5 +146,5 @@ export function renderDelta(events: readonly SessionEvent[], cursor: number, upd
   }
 
   if (sections.length === 0) return { text: '', nextCursor: index }
-  return { text: `## Update ${updateIndex}\n\n${sections.join('\n\n')}`, nextCursor: index }
+  return { text: `## Update ${updateIndex}\n\n${collapseRuns(sections).join('\n\n')}`, nextCursor: index }
 }
