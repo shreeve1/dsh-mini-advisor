@@ -10,11 +10,13 @@ import { RPC_CHANNEL, registerConfigRpc } from './rpc'
 
 export const name = PLUGIN_NAME
 // `settings` backs the live config scope; `goals` is the native same-session
-// goal service the keeper creates goals through. `connection` is deliberately
-// NOT listed: it is an OPTIONAL service (absent in headless profiles), and a
-// missing inject name would strand this whole fiber. registerConfigRpc probes
-// `ctx.connection` at runtime and no-ops when it is absent.
-export const inject = ['agents', 'llm', 'settings', 'goals']
+// goal service the keeper creates goals through. `commands` backs the
+// `/keeper` per-session toggle; it is registered by `@deepseek-ai/dsh-base`,
+// so it is present in both the web and headless profiles and safe to require.
+// `connection` is deliberately NOT listed: it is an OPTIONAL service (absent in
+// headless profiles), and a missing inject name would strand this whole fiber.
+// registerConfigRpc probes `ctx.connection` at runtime and no-ops when absent.
+export const inject = ['agents', 'llm', 'settings', 'goals', 'commands']
 
 // Re-export the schema so the loader can validate this plugin's config.
 export { Config }
@@ -113,10 +115,28 @@ const UPDATE_TASKS_TOOL = {
 
 interface Agent {
   session?: {
+    /** Identity shared with the session log; the key every keeper map uses. */
+    id?: string
     events?: readonly SessionEvent[]
     append?(type: string, data: unknown): unknown
   }
   inject(message: unknown): void
+}
+
+/** One `/keeper` invocation (the subset of dsh-commands' CommandInvocation we read). */
+interface CommandInvocation {
+  agent: Agent
+  rawInput: string
+}
+
+/** The handler outcome the dispatching UI renders. */
+type CommandResult = { kind: 'success'; text?: string } | { kind: 'error'; text: string }
+
+interface CommandDefinition {
+  name: string
+  description: string
+  input?: { hint: string }
+  handler(invocation: CommandInvocation): CommandResult
 }
 
 interface SettingsScope {
@@ -165,6 +185,8 @@ export interface HostContext {
   }
   // Native same-session goal service (dsh-goal), listed in `inject`.
   goals: GoalService
+  // Human-command registry (dsh-commands), listed in `inject`.
+  commands: { register(definition: CommandDefinition): () => void }
   // Optional-service lookup for `connection` (see rpc.ts); undefined when absent.
   get?(name: string): unknown
   logger?: {
@@ -340,6 +362,15 @@ export function apply(ctx: HostContext): void {
   // Per-session advisor activity for the sidebar tab (monitor state only).
   const activity = new ActivityStore()
 
+  // Per-session override of `config.enabled`, set by `/keeper on|off`. A session
+  // with no entry follows the settings-panel toggle, so the panel remains the
+  // default for new sessions and the command is a session-local override — the
+  // same split dsh-fusion uses (settings default + `/fusion` per-agent flip).
+  // Keyed by session id rather than the agent handle because every other keeper
+  // map is, and `session/disposed` already gives us the exact cleanup point.
+  const enabledBySession = new Map<string, boolean>()
+  const isEnabled = (sessionId: string): boolean => enabledBySession.get(sessionId) ?? config.enabled
+
   // RPC transport for the Settings tab and the sidebar tab (trusted-host so
   // remote GUIs work).
   ctx.effect(
@@ -375,7 +406,7 @@ export function apply(ctx: HostContext): void {
   const lastAdviceNotes = new Map<string, string>()
 
   const review = async (sessionId: string): Promise<void> => {
-    if (!config.enabled || disposed.has(sessionId) || reviewing.has(sessionId)) return
+    if (!isEnabled(sessionId) || disposed.has(sessionId) || reviewing.has(sessionId)) return
     const agent = ctx.agents.get(sessionId)
     const events = agent?.session?.events
     if (!agent || !events) return
@@ -524,6 +555,46 @@ export function apply(ctx: HostContext): void {
     }
   }
 
+  // --- /keeper on | off | status -------------------------------------------
+  // The per-session switch. `register` returns a disposer, so it is mounted as
+  // an effect and unregisters cleanly when this fiber unloads.
+  ctx.effect(
+    () =>
+      ctx.commands.register({
+        name: 'keeper',
+        description: 'Goal keeper for this session: /keeper on | off | status',
+        // Declare an unstructured-input hint so capable clients (the web slash
+        // bar) accept trailing arguments. Without it the web composer treats the
+        // command as argument-less: `/keeper on` falls through and is sent to the
+        // model as a prompt instead of dispatching. `/keeper` bare = status.
+        input: { hint: 'on | off | status' },
+        handler: ({ agent, rawInput }) => {
+          const sessionId = sessionIdOf(agent.session)
+          if (!sessionId) return { kind: 'error', text: 'goal keeper: no session on this agent.' }
+          const arg = rawInput.trim().toLowerCase()
+          if (arg === '' || arg === 'status') {
+            const state = isEnabled(sessionId) ? 'on' : 'off'
+            const source =
+              enabledBySession.get(sessionId) === undefined
+                ? 'following the global default'
+                : `session override; global default: ${config.enabled ? 'on' : 'off'}`
+            return { kind: 'success', text: `goal keeper: ${state} (${source})` }
+          }
+          if (arg === 'on' || arg === 'off') {
+            enabledBySession.set(sessionId, arg === 'on')
+            return {
+              kind: 'success',
+              text: arg === 'on'
+                ? 'Goal keeper on for this session — reviews, advice, goals, and tasks resume.'
+                : 'Goal keeper off for this session — no reviews, advice, goals, or tasks.',
+            }
+          }
+          return { kind: 'error', text: 'goal keeper: use `on`, `off`, or `status`.' }
+        },
+      }),
+    `${PLUGIN_NAME}: /keeper command`,
+  )
+
   // Watch the durable transcript stream for turn boundaries. `session/event`
   // is the documented replay-data consumer path; a `turn/end` marks a complete
   // unit of the primary agent's work to review (agent-lifecycle.md).
@@ -560,6 +631,7 @@ export function apply(ctx: HostContext): void {
     reviewing.delete(id)
     stepsThisTurn.delete(id)
     lastAdviceNotes.delete(id)
+    enabledBySession.delete(id)
     activity.drop(id)
   })
 }

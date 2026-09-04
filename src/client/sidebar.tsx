@@ -1,7 +1,7 @@
 /**
- * Optional dsh-better-sidebar integration: registers a "Mini Advisor" tab in
+ * Optional dsh-better-sidebar integration: registers a "Goal Keeper" tab in
  * the sidebar workbench when (and only when) dsh-better-sidebar is installed
- * and active. Shows this session's advisor status plus the feed of advisories
+ * and active. Shows this session's keeper status plus the feed of advisories
  * it has issued, with a tab-strip badge = advice count.
  *
  * Detection contract (never a hard dependency):
@@ -12,7 +12,7 @@
  *    times, then give up silently. Absent/disabled sidebar ⇒ zero UI trace.
  *  - Registration is wrapped in ctx.effect so HMR/disable disposes it.
  *
- * Data: the `/dsh-mini-advisor` `status` RPC, polled at 2s while registered.
+ * Data: the `/dsh-goal-keeper` `status` RPC, polled at 2s while registered.
  * A shared module-level cache feeds both the tab component and the synchronous
  * tab-strip badge, scoped to the session better-sidebar passes each tab.
  */
@@ -21,7 +21,7 @@ import { RPC_CHANNEL } from '../rpc'
 
 const { useEffect, useState } = React
 
-const TAB_ID = 'mini-advisor:advisories'
+const TAB_ID = 'goal-keeper:advisories'
 const POLL_MS = 2000
 const PROBE_INTERVAL_MS = 1000
 const PROBE_MAX_ATTEMPTS = 15
@@ -168,7 +168,7 @@ function AdvisoriesTab(props: { scopedSessionId?: string }): React.ReactElement 
   return (
     <div style={panel}>
       <div style={card}>
-        <strong>Mini Advisor</strong>
+        <strong>Goal Keeper</strong>
         {session ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <span style={chip}>{session.reviews} reviews</span>
@@ -182,7 +182,7 @@ function AdvisoriesTab(props: { scopedSessionId?: string }): React.ReactElement 
             )}
           </div>
         ) : (
-          <span style={hint}>No advisor activity for this session yet. Advice appears here after the next turn.</span>
+          <span style={hint}>No keeper activity for this session yet. Advice appears here after the next turn.</span>
         )}
       </div>
 
@@ -295,7 +295,7 @@ export function mountSidebarTab(ctx: SidebarHost): void {
       try {
         unregister = service.registerTab({
           id: TAB_ID,
-          title: () => 'Mini Advisor',
+          title: () => 'Goal Keeper',
           icon: (size: number) => React.createElement(AdvisorIcon, { size }),
           order: 60,
           single: true,
@@ -306,9 +306,9 @@ export function mountSidebarTab(ctx: SidebarHost): void {
             }),
         })
         if (ctx.connection) releasePoll = acquire(ctx.connection)
-        ctx.logger?.info?.('dsh-mini-advisor: registered Mini Advisor tab in dsh-better-sidebar')
+        ctx.logger?.info?.('dsh-goal-keeper: registered Goal Keeper tab in dsh-better-sidebar')
       } catch (error) {
-        ctx.logger?.info?.(`dsh-mini-advisor: better-sidebar registration skipped (${String((error as Error)?.message ?? error)})`)
+        ctx.logger?.info?.(`dsh-goal-keeper: better-sidebar registration skipped (${String((error as Error)?.message ?? error)})`)
         return true // service exists but rejected us; stop probing
       }
       return true
@@ -338,5 +338,5 @@ export function mountSidebarTab(ctx: SidebarHost): void {
         }
       }
     }
-  }, 'dsh-mini-advisor: better-sidebar tab')
+  }, 'dsh-goal-keeper: better-sidebar tab')
 }

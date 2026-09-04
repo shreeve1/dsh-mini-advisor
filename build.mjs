@@ -67,4 +67,4 @@ await build({
   logLevel: 'warning',
 })
 
-console.log('dsh-mini-advisor: built lib/index.js + lib/client.js')
+console.log('dsh-goal-keeper: built lib/index.js + lib/client.js')

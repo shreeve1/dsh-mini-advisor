@@ -8,6 +8,12 @@
  * `unavailable`, which would hide this whole section), while the channel's
  * trusted-host fence works anywhere the GUI works.
  *
+ * Changes save automatically, matching the Fusion panel: toggles and selects
+ * commit on change, free-text fields commit after a short pause (and on blur /
+ * unmount). There is no Save button — an explicit-save form silently discarded
+ * a toggle whenever the user flipped it and closed the panel without noticing
+ * the footer. "Reload" re-reads the host value and discards local edits.
+ *
  * Provider / model / reasoningEffort are LOCKED `<select>` dropdowns auto-
  * populated from the host's `pickers` endpoint, so the user can only pick
  * values the runtime can actually serve. A value the saved config still
@@ -18,7 +24,14 @@
 import * as React from 'react'
 import { RPC_CHANNEL } from '../rpc'
 
-const { useCallback, useEffect, useState } = React
+const { useCallback, useEffect, useRef, useState } = React
+
+/**
+ * Debounce for free-text fields (persona, min delta chars). Toggles and selects
+ * commit immediately; typing does not, so a long persona is one save, not one
+ * save per keystroke.
+ */
+const TEXT_COMMIT_DELAY_MS = 600
 
 interface ConfigView {
   enabled: boolean
@@ -108,27 +121,79 @@ export function createSettingsSection(ctx: ClientCtx): React.ComponentType<{ clo
       void loadPickers()
     }, [load, loadPickers])
 
-    const save = useCallback(async () => {
-      if (!config) return
-      setSaving(true)
-      setStatus('Saving…')
-      try {
-        const res = await ctx.connection.rpc.call(RPC_CHANNEL, 'update', { patch: config })
-        const { config: saved } = unwrap<{ config: ConfigView }>(res, 'update')
-        setConfig(saved)
-        setStatus('Saved.')
-      } catch (error) {
-        setStatus(String((error as Error).message))
-      } finally {
-        setSaving(false)
+    // Persist one partial change. The server returns the normalized config, but
+    // we deliberately do NOT feed it back into `config` here: an in-flight save
+    // resolving after the user has already moved another control would rewind
+    // that newer edit. Local state stays the source of truth for the form; the
+    // server value is only adopted on an explicit `load()`.
+    const commit = useCallback(
+      async (next: ConfigView) => {
+        setSaving(true)
+        setStatus('Saving…')
+        try {
+          const res = await ctx.connection.rpc.call(RPC_CHANNEL, 'update', { patch: next })
+          unwrap<{ config: ConfigView }>(res, 'update')
+          setStatus('Saved.')
+        } catch (error) {
+          // Surface the failure AND resync from the host, so the form can never
+          // keep showing a value the server rejected.
+          setStatus(String((error as Error).message))
+          void load()
+        } finally {
+          setSaving(false)
+        }
+      },
+      [load],
+    )
+
+    // Pending debounce for free-text fields; flushed on unmount so a save is
+    // never lost by closing the panel mid-timer.
+    const textTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+    const pendingText = useRef<ConfigView | undefined>(undefined)
+
+    const flushText = useCallback(() => {
+      if (textTimer.current !== undefined) {
+        clearTimeout(textTimer.current)
+        textTimer.current = undefined
       }
-    }, [config])
+      const pending = pendingText.current
+      pendingText.current = undefined
+      if (pending) void commit(pending)
+    }, [commit])
+
+    useEffect(() => () => flushText(), [flushText])
 
     if (!config) {
       return <div style={styles.root}>{status ? <span style={styles.status}>{status}</span> : 'Loading…'}</div>
     }
 
-    const patch = (next: Partial<ConfigView>): void => setConfig({ ...config, ...next })
+    /** Toggles and selects: update the form and persist immediately. */
+    const patch = (next: Partial<ConfigView>): void => {
+      const merged = { ...config, ...next }
+      setConfig(merged)
+      // A committed control supersedes any half-typed text still waiting, so
+      // fold the pending text into this write instead of racing it.
+      if (pendingText.current) {
+        if (textTimer.current !== undefined) clearTimeout(textTimer.current)
+        textTimer.current = undefined
+        pendingText.current = undefined
+      }
+      void commit(merged)
+    }
+
+    /** Free-text fields: update the form now, persist after a short pause. */
+    const patchText = (next: Partial<ConfigView>): void => {
+      const merged = { ...config, ...next }
+      setConfig(merged)
+      pendingText.current = merged
+      if (textTimer.current !== undefined) clearTimeout(textTimer.current)
+      textTimer.current = setTimeout(() => {
+        textTimer.current = undefined
+        const pending = pendingText.current
+        pendingText.current = undefined
+        if (pending) void commit(pending)
+      }, TEXT_COMMIT_DELAY_MS)
+    }
 
     // The currently-saved provider/model may be unauthenticated (e.g. live value
     // points at a route whose key is gone). Show it as a disabled-looking
@@ -253,7 +318,12 @@ export function createSettingsSection(ctx: ClientCtx): React.ComponentType<{ clo
 
         <div style={styles.row}>
           <span style={styles.label}>Persona</span>
-          <textarea style={styles.textarea} value={config.persona} onChange={(e) => patch({ persona: e.target.value })} />
+          <textarea
+            style={styles.textarea}
+            value={config.persona}
+            onChange={(e) => patchText({ persona: e.target.value })}
+            onBlur={flushText}
+          />
           <span style={styles.hint}>The keeper's reviewing instructions.</span>
         </div>
 
@@ -264,7 +334,8 @@ export function createSettingsSection(ctx: ClientCtx): React.ComponentType<{ clo
             type="number"
             min={0}
             value={config.minDeltaChars}
-            onChange={(e) => patch({ minDeltaChars: Math.max(0, Number(e.target.value) || 0) })}
+            onChange={(e) => patchText({ minDeltaChars: Math.max(0, Number(e.target.value) || 0) })}
+            onBlur={flushText}
           />
           <span style={styles.hint}>Skip a review when the transcript delta is shorter than this.</span>
         </div>
@@ -290,13 +361,10 @@ export function createSettingsSection(ctx: ClientCtx): React.ComponentType<{ clo
         </label>
 
         <div style={styles.footer}>
-          <button style={styles.button} onClick={() => void save()} disabled={saving}>
-            {saving ? 'Saving…' : 'Save'}
-          </button>
+          <span style={styles.status}>{status || 'Changes save automatically.'}</span>
           <button style={styles.button} onClick={() => void load()} disabled={saving}>
-            Reset
+            Reload
           </button>
-          {status ? <span style={styles.status}>{status}</span> : null}
         </div>
       </div>
     )

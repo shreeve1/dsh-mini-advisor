@@ -1,7 +1,7 @@
 {
-  "name": "dsh-mini-advisor",
-  "version": "0.3.1",
-  "description": "A minimal advisor watchdog for DeepSeek Harness: a second model reviews each turn and injects weighable advice.",
+  "name": "dsh-goal-keeper",
+  "version": "0.3.4",
+  "description": "A goal-keeper for DeepSeek Harness: a second model reviews each turn, keeps the session goal and todos current, and injects weighable advice.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -20,7 +20,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "prepack": "node build.mjs",
-    "prepare": "node -e \"process.exit(require('fs').existsSync('lib/client.js')?0:1)\" || node build.mjs || echo \"dsh-mini-advisor: build skipped, using prebuilt lib/\""
+    "prepare": "node -e \"process.exit(require('fs').existsSync('lib/client.js')?0:1)\" || node build.mjs || echo \"dsh-goal-keeper: build skipped, using prebuilt lib/\""
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",

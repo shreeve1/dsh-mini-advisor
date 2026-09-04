@@ -57,5 +57,11 @@ export function normalizeConfig(raw: unknown): Config {
   // Schemastery schemas are callable validators that fill defaults from any
   // partial/unknown input at runtime; the parameter type is stricter than the
   // real contract, so pass through an unknown-accepting call signature.
-  return (Config as unknown as (input: unknown) => Config)(raw ?? {})
+  //
+  // `??` only guards null/undefined; any other non-object falsy value (notably
+  // `0`, but also `''` and `false`) would pass straight into the validator and
+  // throw "expected object but got X". Guard on actual object-ness so runtime
+  // settings snapshots that resolve to a primitive fall back to defaults.
+  const safe = typeof raw === 'object' && raw !== null ? raw : {}
+  return (Config as unknown as (input: unknown) => Config)(safe)
 }

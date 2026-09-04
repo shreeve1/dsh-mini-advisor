@@ -1,6 +1,6 @@
 /**
- * dsh-mini-advisor browser half: registers the "Mini Advisor" settings section
- * and — when dsh-better-sidebar is installed — a "Mini Advisor" tab in the
+ * dsh-goal-keeper browser half: registers the "Goal Keeper" settings section
+ * and — when dsh-better-sidebar is installed — a "Goal Keeper" tab in the
  * sidebar workbench (optional runtime probe; see ./sidebar.tsx).
  * Loaded through package.json `dsh.client` (web platform) and wrapped for the
  * DSH browser ModuleLoader by build.mjs.
@@ -8,7 +8,7 @@
 import { createSettingsSection } from './SettingsSection'
 import { mountSidebarTab } from './sidebar'
 
-export const name = 'dsh-mini-advisor'
+export const name = 'dsh-goal-keeper'
 
 // Cordis SERVICE names this module consumes (NOT package names — those go in
 // package.json `dsh.client.inject`). The browser fiber waits until each is
@@ -36,15 +36,15 @@ export function apply(ctx: ClientCtx): void {
         yield ctx.slots.register(
           {
             name: 'settings.section',
-            id: 'dsh-mini-advisor',
+            id: 'dsh-goal-keeper',
             order: 50,
-            label: () => 'Mini Advisor',
+            label: () => 'Goal Keeper',
             inject: () => ({}),
           },
           createSettingsSection(ctx),
         )
       }),
-    'dsh-mini-advisor: settings section',
+    'dsh-goal-keeper: settings section',
   )
 
   // Optional dsh-better-sidebar tab (runtime probe, never a hard dep).

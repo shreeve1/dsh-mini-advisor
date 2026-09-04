@@ -1,13 +1,14 @@
-// Native DSH goal + task creation, called directly by the advisor.
+// Native DSH goal + task operations for the goal-keeper.
 //
-// Goals: `ctx.goals.create(agent, { objective })` — the first-class same-session
-//   goal service (dsh-goal). The goal appears in the native goal UI and drives
-//   continuation via the goal-round-driver.
-// Tasks: appended as a `todo/write` session event. That event is LOG-ONLY
-//   (persistence-catalog: "todo/write — log-only"), so `session.append` needs no
-//   SurfaceIntent, and the UI renders the latest todo/write as the checklist.
-//   The list is replaced wholesale on every write, so to coexist with the
-//   primary agent's todos we fold the latest list and append our tasks.
+// Goals use the first-class same-session goal service (@deepseek-ai/dsh-goal,
+// injected as `goals`). The keeper drives the goal to completion, so it needs
+// more than create: it reads the current goal (`get`), creates one when none
+// exists, edits the objective when one already does (instead of the old
+// silent no-op), and completes it when the objective is met.
+//
+// Tasks are appended as a `todo/write` session event (log-only per the
+// persistence catalog), folded so the keeper never clobbers the primary
+// agent's own todos.
 
 /** One todo entry — the unit of the todo/write event (session.md TodoItem). */
 export interface TodoItem {
@@ -23,13 +24,54 @@ export interface AgentLike {
   }
 }
 
-export interface GoalService {
-  create(agent: AgentLike, request: { objective: string; maxGoalRounds?: number }): unknown
+/** A goal reference — the revision-checked handle the service mutations need. */
+export interface GoalRef {
+  id: string
+  revision: number
 }
 
-/** Create and arm a native same-session goal. Returns nothing model-visible. */
-export function createGoal(goals: GoalService, agent: AgentLike, objective: string): void {
-  goals.create(agent, { objective })
+/** The subset of a GoalView the keeper reads. */
+export interface GoalView extends GoalRef {
+  objective: string
+  phase: 'active' | 'paused' | 'blocked' | 'complete'
+}
+
+/**
+ * The native goal service surface the keeper uses. Mirrors @deepseek-ai/dsh-goal:
+ * `get` reads the current goal (undefined when none), `create` mints a fresh
+ * goal (throws GOAL_ALREADY_EXISTS if a non-complete goal exists), `edit`
+ * revises the objective in place, `complete` closes it.
+ */
+export interface GoalService {
+  get(agent: AgentLike): GoalView | undefined
+  create(agent: AgentLike, request: { objective: string; maxGoalRounds?: number }): GoalView
+  edit(agent: AgentLike, ref: GoalRef, request: { objective?: string; maxGoalRounds?: number }): GoalView
+  complete(agent: AgentLike, ref: GoalRef): GoalView
+}
+
+/**
+ * Set the session objective: create a goal when none is current (or the current
+ * one is already complete), otherwise edit the existing goal's objective in
+ * place. This replaces the old create-only path that silently no-opped whenever
+ * a goal already existed. Returns the resulting view, or undefined on no-op.
+ */
+export function setGoal(goals: GoalService, agent: AgentLike, objective: string): GoalView | undefined {
+  const current = goals.get(agent)
+  if (!current || current.phase === 'complete') {
+    return goals.create(agent, { objective })
+  }
+  if (current.objective === objective) return current
+  return goals.edit(agent, { id: current.id, revision: current.revision }, { objective })
+}
+
+/**
+ * Complete the current goal when one is open. No-ops when there is no goal or it
+ * is already complete. Returns the completed view, or undefined on no-op.
+ */
+export function completeGoal(goals: GoalService, agent: AgentLike): GoalView | undefined {
+  const current = goals.get(agent)
+  if (!current || current.phase === 'complete') return undefined
+  return goals.complete(agent, { id: current.id, revision: current.revision })
 }
 
 /** Fold the latest `todo/write` event into the current todo list (or empty). */
@@ -51,7 +93,7 @@ export function currentTodos(agent: AgentLike): TodoItem[] {
 }
 
 /**
- * Append advisor tasks to the primary agent's todo list without clobbering it:
+ * Append keeper tasks to the primary agent's todo list without clobbering it:
  * read the current list, add the new tasks (deduped by content), and write the
  * merged list back as one `todo/write` event. New tasks are `pending`.
  */
